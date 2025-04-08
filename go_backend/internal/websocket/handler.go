@@ -34,20 +34,23 @@ func Handler(mqttClient mqtt.Client) http.HandlerFunc {
 		}
 		defer ws.Close()
 
-		// Extract client identifier if possible (e.g., from URL path or query param)
-		// clientID := r.URL.Query().Get("clientId")
-		// if clientID == "" {
-		// 	log.Printf("[WebSocket] Client connected without ID from %s", ws.RemoteAddr())
-		// 	// Optionally close connection if ID is required
-		// 	// ws.Close()
-		// 	// return
-		// } else {
-		// 	log.Printf("[WebSocket] Client '%s' connected from %s", clientID, ws.RemoteAddr())
-		// }
-		log.Printf("[WebSocket] Client connected from %s", ws.RemoteAddr())
+		// Log headers for debugging
+		log.Printf("[WebSocket] New connection from %s with headers:", ws.RemoteAddr())
+		for k, v := range r.Header {
+			log.Printf("[WebSocket] Header %s: %v", k, v)
+		}
 
-		// TODO: Register the connection (e.g., in a map[string]*websocket.Conn)
-		// associated with its clientID for targeted MQTT message forwarding.
+		// Send a welcome message (similar to the "Server Hello" expected by ESP32)
+		welcomeMsg := `{"type":"server_hello","status":"ok","transport":"websocket"}`
+		if err := ws.WriteMessage(websocket.TextMessage, []byte(welcomeMsg)); err != nil {
+			log.Printf("[WebSocket] Failed to send welcome message: %v", err)
+		} else {
+			log.Printf("[WebSocket] Sent welcome message to %s", ws.RemoteAddr())
+		}
+
+		// Track audio frame count for less verbose logging
+		audioFrameCount := 0
+		totalAudioBytes := 0
 
 		// Read loop
 		for {
@@ -64,27 +67,38 @@ func Handler(mqttClient mqtt.Client) http.HandlerFunc {
 				break // Exit loop on error or disconnect
 			}
 
-			log.Printf("[WebSocket] Received message (type %d) from %s: %s", messageType, ws.RemoteAddr(), p)
-
-			// --- Message Processing Logic --- 
-			// 1. Determine message type (e.g., JSON command, binary audio)
-			// 2. Parse the message
-			// 3. Decide action: Echo, Publish to MQTT, process internally, etc.
-
-			// Example: Publish non-binary messages to a default MQTT topic
-			if messageType == websocket.TextMessage {
-				// Modify topic based on clientID or message content if needed
+			// Handle different message types
+			switch messageType {
+			case websocket.TextMessage:
+				// For text messages, log the full content (could be commands or status updates)
+				log.Printf("[WebSocket] Received text message from %s: %s", ws.RemoteAddr(), string(p))
+				
+				// Example: Publish non-binary messages to MQTT topic
 				go internalmqtt.Publish(mqttClient, "xiaozhi/ws/ingress", p, 0, false)
+			
+			case websocket.BinaryMessage:
+				// For binary messages (likely audio data), only log count and size
+				audioFrameCount++
+				totalAudioBytes += len(p)
+				
+				// Only log every 20 frames to reduce console spam
+				if audioFrameCount % 20 == 0 {
+					log.Printf("[WebSocket] Received %d audio frames (%d bytes total) from %s", 
+						audioFrameCount, totalAudioBytes, ws.RemoteAddr())
+				}
+				
+				// For now, we just echo the binary data back
+				// In a real implementation, you might process the audio data or forward it
 			}
 
-			// Echo message back (remove or modify based on requirements)
+			// Echo message back (this will later be replaced with actual processing)
 			if err := ws.WriteMessage(messageType, p); err != nil {
 				log.Printf("[WebSocket] Error writing message to %s: %v", ws.RemoteAddr(), err)
 				break // Exit loop on write error
 			}
 		}
 
-		log.Printf("[WebSocket] Client %s disconnected", ws.RemoteAddr())
-		// TODO: Unregister the connection
+		log.Printf("[WebSocket] Client %s disconnected, received %d audio frames (%d bytes total)", 
+			ws.RemoteAddr(), audioFrameCount, totalAudioBytes)
 	}
 } 

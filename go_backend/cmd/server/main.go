@@ -32,19 +32,31 @@ func main() {
 		}
 	}()
 
-	// Setup HTTP server
-	http.HandleFunc("/xiaozhi/v1/", internalws.Handler(mqttClient))
+	// Setup WebSocket handler
+	wsHandler := internalws.Handler(mqttClient)
+	http.HandleFunc("/xiaozhi/v1/", wsHandler)
 
 	// Create a channel to listen for OS signals (like Ctrl+C)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start HTTP server in a goroutine
+	// Start HTTP servers in goroutines
+	// Primary server on configured port (default: 8000)
 	go func() {
 		serverAddr := ":" + cfg.ServerPort
 		log.Printf("HTTP server listening on %s", serverAddr)
 		if err := http.ListenAndServe(serverAddr, nil); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Could not listen on %s: %v\n", serverAddr, err)
+			log.Printf("Could not listen on %s: %v\n", serverAddr, err)
+		}
+	}()
+
+	// Additional server on port 80 to match ESP32 configuration
+	go func() {
+		serverAddr := ":80"
+		log.Printf("HTTP server also listening on %s (for ESP32 compatibility)", serverAddr)
+		if err := http.ListenAndServe(serverAddr, nil); err != nil && err != http.ErrServerClosed {
+			log.Printf("Could not listen on %s: %v - This is expected if not running as admin or port 80 is already in use\n", serverAddr, err)
+			// We don't exit here, as the main server on port 8000 might still be running
 		}
 	}()
 
