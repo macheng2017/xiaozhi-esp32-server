@@ -5,102 +5,129 @@ import (
 	"log"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/xiaozhi-esp32-server/go_backend/internal/config" // Import config package
+	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/xiaozhi-esp32-server/go_backend/internal/config"
 )
 
-// Define handlers as package-level variables or within a struct if preferred
-var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
-	log.Printf("[MQTT] Received message: %s from topic: %s\n", msg.Payload(), msg.Topic())
-	// Add logic here to handle incoming MQTT messages.
-	// This might involve finding a corresponding WebSocket connection
-	// based on the topic or payload and forwarding the message.
+// Client 是 MQTT 客户端的包装器
+type Client struct {
+	client    paho.Client
+	connected bool
 }
 
-var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
-	log.Println("[MQTT] Connected to Broker")
-	// Subscribe to topics upon connection
-	subscribeToTopics(client)
-}
+// NewClient 创建一个新的 MQTT 客户端
+func NewClient(cfg *config.Config) *Client {
+	log.Printf("[MQTT] Connecting to broker: %s", cfg.MqttBroker)
 
-var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
-	log.Printf("[MQTT] Connection Lost: %v", err)
-	// Consider adding reconnection logic here
-}
+	opts := paho.NewClientOptions().
+		AddBroker(fmt.Sprintf("tcp://%s", cfg.MqttBroker)).
+		SetClientID(cfg.MqttClientID).
+		SetAutoReconnect(true).
+		SetCleanSession(true).
+		SetMaxReconnectInterval(10 * time.Second)
 
-// NewClient initializes and connects the MQTT client
-func NewClient(cfg *config.Config) mqtt.Client {
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(fmt.Sprintf("tcp://%s", cfg.MQTTBroker))
-	// Generate a unique client ID
-	clientID := "go_backend_server_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	opts.SetClientID(clientID)
-	// Optional: Set username and password if required by the broker
-	// opts.SetUsername("your_username")
-	// opts.SetPassword("your_password")
-	opts.SetDefaultPublishHandler(messagePubHandler)
-	opts.OnConnect = connectHandler
-	opts.OnConnectionLost = connectLostHandler
-	// Increase PING timeout, helpful for less stable connections
-	opts.SetPingTimeout(10 * time.Second)
-	opts.SetKeepAlive(30 * time.Second)
-	opts.SetAutoReconnect(true)
-	opts.SetMaxReconnectInterval(10 * time.Second)
-
-	client := mqtt.NewClient(opts)
-	if token := client.Connect(); token.WaitTimeout(5*time.Second) && token.Error() != nil {
-		// Log fatal might be too harsh, maybe return error?
-		log.Printf("[MQTT] Failed to connect to broker: %v. Retrying in background...", token.Error())
-		// Don't use log.Fatalf here, allow the server to start anyway
-		// The auto-reconnect mechanism will handle retries.
-	} else if token.Error() == nil {
-		log.Printf("[MQTT] Connection attempt initiated for client ID: %s", clientID)
-	} else {
-		log.Printf("[MQTT] Connection timed out for client ID: %s. Retrying in background...", clientID)
+	// 如果提供了用户名和密码，则添加到选项中
+	if cfg.MqttUsername != "" {
+		opts.SetUsername(cfg.MqttUsername)
+		if cfg.MqttPassword != "" {
+			opts.SetPassword(cfg.MqttPassword)
+		}
 	}
 
-	return client
-}
+	// 设置各种回调函数
+	opts.SetConnectionLostHandler(func(client paho.Client, err error) {
+		log.Printf("[MQTT] Connection lost: %v", err)
+	})
 
-// subscribeToTopics subscribes the client to relevant MQTT topics
-// This should be customized based on your application's needs.
-func subscribeToTopics(client mqtt.Client) {
-	// Example: Subscribe to a general command topic
-	topic := "xiaozhi/commands/all"
-	if token := client.Subscribe(topic, 1, nil); token.WaitTimeout(5*time.Second) && token.Error() != nil {
-		log.Printf("[MQTT] Failed to subscribe to topic %s: %v", topic, token.Error())
-	} else if token.Error() == nil {
-		log.Printf("[MQTT] Subscribed to topic: %s", topic)
+	opts.SetOnConnectHandler(func(client paho.Client) {
+		log.Printf("[MQTT] Connected to broker")
+	})
+
+	client := paho.NewClient(opts)
+
+	mqttClient := &Client{
+		client:    client,
+		connected: false,
 	}
 
-	// Example: Subscribe to device status updates (using a wildcard)
-	statusTopic := "xiaozhi/status/+" // + is a single-level wildcard
-	if token := client.Subscribe(statusTopic, 0, messagePubHandler); token.WaitTimeout(5*time.Second) && token.Error() != nil {
-		log.Printf("[MQTT] Failed to subscribe to topic %s: %v", statusTopic, token.Error())
-	} else if token.Error() == nil {
-		log.Printf("[MQTT] Subscribed to topic: %s", statusTopic)
-	}
+	// 尝试连接，但不阻塞
+	go func() {
+		for {
+			log.Printf("[MQTT] Attempting connection to broker...")
+			if token := client.Connect(); token.Wait() && token.Error() != nil {
+				log.Printf("[MQTT] Failed to connect to broker: %v. Retrying in background...", token.Error())
+				time.Sleep(5 * time.Second)
+			} else {
+				mqttClient.connected = true
+				log.Printf("[MQTT] Successfully connected to broker")
+				break
+			}
+		}
+	}()
 
-	// Add other necessary subscriptions here
+	return mqttClient
 }
 
-// Publish sends a message to a specific MQTT topic
-func Publish(client mqtt.Client, topic string, payload interface{}, qos byte, retained bool) error {
-	if !client.IsConnected() {
+// IsConnected 返回客户端是否已连接
+func (c *Client) IsConnected() bool {
+	return c.connected && c.client.IsConnectionOpen()
+}
+
+// Publish 向指定的主题发布消息
+func (c *Client) Publish(topic string, qos byte, retained bool, payload interface{}) error {
+	if !c.IsConnected() {
 		log.Printf("[MQTT] WARN: Attempted to publish while not connected.")
-		// Depending on requirements, you might queue the message or return an error
 		return fmt.Errorf("mqtt client not connected")
 	}
-	token := client.Publish(topic, qos, retained, payload)
-	// Optionally wait with timeout for confirmation, especially for QoS > 0
-	if success := token.WaitTimeout(2 * time.Second); !success {
-		log.Printf("[MQTT] WARN: Timeout waiting for publish confirmation to topic %s", topic)
-		// return fmt.Errorf("timeout waiting for publish confirmation")
+
+	token := c.client.Publish(topic, qos, retained, payload)
+	if token.Wait() && token.Error() != nil {
+		log.Printf("[MQTT] Failed to publish to topic %s: %v", topic, token.Error())
+		return token.Error()
 	}
-	if err := token.Error(); err != nil {
-		log.Printf("[MQTT] ERROR: Failed to publish to topic %s: %v", topic, err)
-		return err
-	}
-	// log.Printf("[MQTT] Published to topic: %s", topic) // Reduce noise, maybe log only on error/warning
+
 	return nil
+}
+
+// Subscribe 订阅指定的主题
+func (c *Client) Subscribe(topic string, qos byte, callback paho.MessageHandler) error {
+	if !c.IsConnected() {
+		log.Printf("[MQTT] WARN: Attempted to subscribe while not connected.")
+		return fmt.Errorf("mqtt client not connected")
+	}
+
+	token := c.client.Subscribe(topic, qos, callback)
+	if token.Wait() && token.Error() != nil {
+		log.Printf("[MQTT] Failed to subscribe to topic %s: %v", topic, token.Error())
+		return token.Error()
+	}
+
+	log.Printf("[MQTT] Successfully subscribed to topic: %s", topic)
+	return nil
+}
+
+// Unsubscribe 取消订阅指定的主题
+func (c *Client) Unsubscribe(topics ...string) error {
+	if !c.IsConnected() {
+		log.Printf("[MQTT] WARN: Attempted to unsubscribe while not connected.")
+		return fmt.Errorf("mqtt client not connected")
+	}
+
+	token := c.client.Unsubscribe(topics...)
+	if token.Wait() && token.Error() != nil {
+		log.Printf("[MQTT] Failed to unsubscribe from topics %v: %v", topics, token.Error())
+		return token.Error()
+	}
+
+	log.Printf("[MQTT] Successfully unsubscribed from topics: %v", topics)
+	return nil
+}
+
+// Disconnect 断开与 MQTT 代理的连接
+func (c *Client) Disconnect(quiesce uint) {
+	if c.IsConnected() {
+		c.client.Disconnect(quiesce)
+		c.connected = false
+		log.Printf("[MQTT] Disconnected from broker")
+	}
 } 
